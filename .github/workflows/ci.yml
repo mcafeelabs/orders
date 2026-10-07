@@ -1,0 +1,131 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+env:
+  SERVICE: orders
+  # svcreg and the chart capabilities this service is checked against.
+  PLATFORM_REF: main
+  CHART_REF: main
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  # Validate service.yaml and the config schema before anything is published.
+  manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: mcafeelabs/platform-chart
+          ref: ${{ env.CHART_REF }}
+          path: .platform-chart
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: svcreg lint-service
+        run: go run github.com/mcafeelabs/platform/cmd/svcreg@${{ env.PLATFORM_REF }} lint-service --capabilities .platform-chart/chart/capabilities.yaml
+
+  image:
+    needs: [test, manifest]
+    # Pushes to main get a semver tag Kargo can promote; same-repo PRs get
+    # pr-<n> for sandboxes.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: version
+        run: |
+          if [ "${{ github.event_name }}" = push ]; then
+            echo "version=0.1.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/${{ env.SERVICE }}:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/${{ env.SERVICE }}:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Publish the manifest and schema to the registry: a PR to
+  # mcafeelabs/services that auto-merges once its checks pass. Needs a
+  # SERVICES_REPO_TOKEN secret (contents + pull-requests write on services).
+  publish:
+    needs: image
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check token
+        id: token
+        env:
+          TOKEN: ${{ secrets.SERVICES_REPO_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::notice::SERVICES_REPO_TOKEN is not set; skipping publish to mcafeelabs/services"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.token.outputs.skip != 'true'
+        uses: actions/checkout@v5
+        with:
+          path: src
+      - if: steps.token.outputs.skip != 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: mcafeelabs/services
+          token: ${{ secrets.SERVICES_REPO_TOKEN }}
+          path: registry
+      - if: steps.token.outputs.skip != 'true'
+        name: Open publish PR
+        env:
+          GH_TOKEN: ${{ secrets.SERVICES_REPO_TOKEN }}
+          VERSION: ${{ needs.image.outputs.version }}
+        run: |
+          set -euo pipefail
+          dest=registry/services/$SERVICE
+          mkdir -p "$dest"
+          header="# Published by CI from github.com/${{ github.repository }}@${GITHUB_SHA::12}. Do not edit here."
+          for f in service.yaml config-values.schema.yaml; do
+            # Swap the leading comment block for the publish header.
+            { echo "$header"; awk 'body || !/^#/ {body=1; print}' "src/$f"; } > "$dest/$f"
+          done
+          [ -f "$dest/values.yaml" ] || printf '# Layer 3: service. Owner: %s.\nimage:\n  tag: ""\n' "$(yq '.owner' src/service.yaml)" > "$dest/values.yaml"
+          # Directly delivered environments (dev) run the latest published image.
+          yq -i ".image.tag = \"$VERSION\"" "$dest/values.yaml"
+          cd registry
+          if git diff --quiet; then echo "nothing to publish"; exit 0; fi
+          branch="publish/$SERVICE-$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git commit -am "publish $SERVICE $VERSION" -m "From ${{ github.server_url }}/${{ github.repository }}/commit/$GITHUB_SHA"
+          git push -u origin "$branch"
+          gh pr create --title "publish $SERVICE $VERSION" --body "Manifest, schema and image tag from ${{ github.repository }}@$GITHUB_SHA." --label publish ||             gh pr create --title "publish $SERVICE $VERSION" --body "Manifest, schema and image tag from ${{ github.repository }}@$GITHUB_SHA."
+          gh pr merge --auto --squash "$branch"
