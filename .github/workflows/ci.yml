@@ -10,6 +10,8 @@ env:
   # svcreg and the chart capabilities this service is checked against.
   PLATFORM_REF: main
   CHART_REF: main
+  # Resolve @main straight from GitHub; the module proxy caches branch queries.
+  GOPRIVATE: github.com/mcafeelabs/*
 jobs:
   test:
     runs-on: ubuntu-latest
